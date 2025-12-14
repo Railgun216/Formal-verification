@@ -30,7 +30,7 @@ pip install z3-solver
 
 ## Usage
 
-### Basic Usage
+### Basic Usage (Single Method)
 
 ```python
 from robustness_verifier import ReLUNetwork, RobustnessVerifier
@@ -44,9 +44,6 @@ network = ReLUNetwork.from_onnx("model.onnx")
 # Create verifier with SMT method
 verifier = RobustnessVerifier(network, method="smt", use_cegar=False)
 
-# Or use MILP method
-# verifier = RobustnessVerifier(network, method="milp", use_cegar=False)
-
 # Define seed input and epsilon
 x0 = np.random.rand(784) / 255.0  # Normalized input
 epsilon = 0.01  # ℓ∞-ball radius
@@ -56,13 +53,59 @@ result, counterexample = verifier.verify_robustness(x0, epsilon)
 
 if result.value == "SAFE":
     print("✓ Network is robust at this input")
-elif result.value == "UNSAFE":
+elif result.value == "COUNTEREXAMPLE":
     print("✗ Counterexample found!")
     print(f"  Original class: {network.predict(x0)}")
     print(f"  Adversarial class: {network.predict(counterexample)}")
 else:
     print("? Verification inconclusive")
 ```
+
+### Dual-Method Verification with Result Recording
+
+For audit purposes, use `DualMethodVerifier` to run both Star Reachability (NNV) and SMT/MILP methods and record all results:
+
+```python
+from robustness_verifier import ReLUNetwork, DualMethodVerifier
+import numpy as np
+
+# Load network
+network = ReLUNetwork.from_mat("model.mat")
+
+# Create dual-method verifier
+verifier = DualMethodVerifier(
+    network,
+    margin_tolerance=1e-6,
+    big_m=1000.0,
+    use_cegar=False
+)
+
+# Single verification with full recording
+x0 = np.random.rand(784) / 255.0
+epsilon = 0.01
+record = verifier.verify(x0, epsilon, test_id="test_001")
+
+# Access results
+print(f"Star Reachability: {record.star_result.value}")
+print(f"SMT/MILP: {record.smt_result.value}")
+print(f"Consistency: {record.consistency_check['status']}")
+
+# Batch verification
+test_cases = [
+    (x0_1, epsilon_1),
+    (x0_2, epsilon_2),
+]
+records = verifier.verify_batch(test_cases, test_ids=["test_001", "test_002"])
+
+# Save all records to JSON
+verifier.save_records(records, "verification_results.json")
+```
+
+The JSON output includes:
+- **Star Reachability results**: Output bounds, margins, input domain
+- **SMT/MILP results**: Exact verification result, counterexample (if found), input domain
+- **Consistency check**: Comparison between both methods
+- **Counterexample replay**: Verification of counterexamples by replay
 
 ### Running the Example
 

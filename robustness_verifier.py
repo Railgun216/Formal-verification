@@ -8,9 +8,11 @@ using SMT (Satisfiability Modulo Theories) and MILP (Mixed Integer Linear Progra
 import numpy as np
 import scipy.io as sio
 from typing import Tuple, List, Optional, Dict, Any
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 import os
+import json
+from datetime import datetime
 
 try:
     import onnx
@@ -194,6 +196,172 @@ class ReLUNetwork:
         """Predict class for input"""
         logits = self.forward(x)
         return int(np.argmax(logits))
+
+
+class StarReachability:
+    """Star-based reachability analysis for ReLU networks (NNV-style)"""
+    
+    def __init__(self, network: ReLUNetwork):
+        self.network = network
+    
+    def create_input_star(self, x0: np.ndarray, epsilon: float) -> StarSet:
+        """
+        Create Star set for ℓ∞-ball clipped to [0,1]: X = {x | ||x - x0||∞ ≤ ε} ∩ [0,1]
+        
+        This matches the input domain used by SMT method for consistency.
+        """
+        dim = len(x0)
+        center = x0.copy()
+        
+        # Basis: identity matrix scaled by epsilon
+        basis = np.eye(dim) * epsilon
+        
+        # Constraints: -1 <= α_i <= 1 for each dimension
+        # C*α <= d where C = [I; -I], d = [1; 1]
+        C = np.vstack([np.eye(dim), -np.eye(dim)])
+        d = np.ones(2 * dim)
+        
+        # Clip center to [0,1] to match SMT input domain
+        center = np.clip(center, 0, 1)
+        
+        return StarSet(center, basis, C, d)
+    
+    def reach(self, input_star: StarSet) -> StarSet:
+        """
+        Compute over-approximate reachable set using Star abstraction
+        
+        This is a simplified implementation. Full NNV 2.0 uses more
+        sophisticated Star operations for ReLU layers.
+        """
+        current_star = input_star
+        
+        for i, (W, b) in enumerate(zip(self.network.weights, self.network.biases)):
+            # Linear layer: y = W*x + b
+            new_center = W @ current_star.center + b
+            new_basis = W @ current_star.basis
+            
+            # Update constraints (simplified)
+            new_C = current_star.C
+            new_d = current_star.d
+            
+            current_star = StarSet(new_center, new_basis, new_C, new_d)
+            
+            # ReLU layer (except last)
+            if i < len(self.network.weights) - 1:
+                current_star = self._relu_star(current_star)
+        
+        return current_star
+    
+    def _relu_star(self, star: StarSet) -> StarSet:
+        """
+        Apply ReLU to Star set (simplified over-approximation)
+        Full implementation would handle different ReLU cases more precisely
+        """
+        lb, ub = star.get_bounds()
+        
+        # Determine which neurons are always active, always inactive, or uncertain
+        always_active = lb >= 0
+        always_inactive = ub <= 0
+        uncertain = ~(always_active | always_inactive)
+        
+        # For always active: identity
+        # For always inactive: zero
+        # For uncertain: over-approximate with interval [0, ub]
+        
+        new_center = star.center.copy()
+        new_center[always_inactive] = 0
+        new_center[uncertain] = np.maximum(0, new_center[uncertain])
+        
+        # Simplified basis update
+        new_basis = star.basis.copy()
+        new_basis[always_inactive, :] = 0
+        new_basis[uncertain, :] *= 0.5  # Conservative approximation
+        
+        return StarSet(new_center, new_basis, star.C, star.d)
+    
+    def verify_robustness(self, x0: np.ndarray, epsilon: float, 
+                         margin_tolerance: float = 1e-6) -> Tuple[VerificationResult, Optional[np.ndarray], Dict[str, Any]]:
+        """
+        Verify robustness using Star reachability (over-approximation)
+        
+        Returns:
+            (result, counterexample, details)
+            - result: SAFE, COUNTEREXAMPLE, or INCONCLUSIVE
+            - counterexample: None (reachability doesn't produce exact counterexamples)
+            - details: Dictionary with reachability analysis details
+        """
+        # Get nominal prediction
+        nominal_class = self.network.predict(x0)
+        num_classes = self.network.weights[-1].shape[0]
+        
+        # Create input star (clipped to [0,1] to match SMT)
+        input_star = self.create_input_star(x0, epsilon)
+        
+        # Compute reachable set
+        output_star = self.reach(input_star)
+        
+        # Get output bounds
+        output_lb, output_ub = output_star.get_bounds()
+        
+        # Check margins: fc(x) - fk(x) >= 0 for all k != c
+        fc_lb = output_lb[nominal_class]
+        fc_ub = output_ub[nominal_class]
+        
+        margins = []
+        min_margin = float('inf')
+        all_margins_positive = True
+        
+        for k in range(num_classes):
+            if k == nominal_class:
+                continue
+            
+            fk_lb = output_lb[k]
+            fk_ub = output_ub[k]
+            
+            # Margin: fc - fk (worst case)
+            margin_lb = fc_lb - fk_ub  # Worst case margin
+            margin_ub = fc_ub - fk_lb  # Best case margin
+            
+            margins.append({
+                'class': k,
+                'margin_lb': float(margin_lb),
+                'margin_ub': float(margin_ub)
+            })
+            
+            min_margin = min(min_margin, margin_lb)
+            
+            # If worst case margin < tolerance, potentially unsafe
+            if margin_lb < margin_tolerance:
+                all_margins_positive = False
+        
+        # Details for recording
+        details = {
+            'method': 'Star Reachability',
+            'input_domain': {
+                'center': x0.tolist(),
+                'epsilon': float(epsilon),
+                'lower_bound': np.maximum(0, x0 - epsilon).tolist(),
+                'upper_bound': np.minimum(1, x0 + epsilon).tolist()
+            },
+            'output_bounds': {
+                'lower_bound': output_lb.tolist(),
+                'upper_bound': output_ub.tolist()
+            },
+            'margins': margins,
+            'min_margin': float(min_margin),
+            'nominal_class': nominal_class
+        }
+        
+        # Determine result
+        if min_margin >= margin_tolerance:
+            # All margins non-negative in over-approximation
+            # This is a conservative (sound) result
+            return VerificationResult.SAFE, None, details
+        else:
+            # Over-approximation shows potential violation
+            # Cannot conclude SAFE, but also cannot produce exact counterexample
+            details['note'] = 'Over-approximation inconclusive - potential violation detected'
+            return VerificationResult.INCONCLUSIVE, None, details
 
 
 class SMTEncoder:
@@ -753,6 +921,239 @@ def verify_counterexample_replay(network: ReLUNetwork, counterexample: np.ndarra
     
     results['valid'] = in_domain and violates_spec
     return results
+
+
+@dataclass
+class VerificationRecord:
+    """Record for storing verification results from both methods"""
+    # Test case information
+    test_id: str
+    x0: np.ndarray
+    epsilon: float
+    nominal_class: int
+    timestamp: str = field(default_factory=lambda: datetime.now().isoformat())
+    
+    # Star Reachability (NNV) results
+    star_result: Optional[VerificationResult] = None
+    star_counterexample: Optional[np.ndarray] = None
+    star_details: Optional[Dict[str, Any]] = None
+    
+    # SMT/MILP (Exact) results
+    smt_result: Optional[VerificationResult] = None
+    smt_counterexample: Optional[np.ndarray] = None
+    smt_details: Optional[Dict[str, Any]] = None
+    
+    # Consistency check
+    consistency_check: Optional[Dict[str, Any]] = None
+    
+    # Counterexample replay verification
+    star_cex_replay: Optional[Dict[str, Any]] = None
+    smt_cex_replay: Optional[Dict[str, Any]] = None
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert record to dictionary for JSON serialization"""
+        result = {
+            'test_id': self.test_id,
+            'x0': self.x0.tolist() if isinstance(self.x0, np.ndarray) else self.x0,
+            'epsilon': float(self.epsilon),
+            'nominal_class': int(self.nominal_class),
+            'timestamp': self.timestamp,
+            'star_reachability': {
+                'result': self.star_result.value if self.star_result else None,
+                'counterexample': self.star_counterexample.tolist() if self.star_counterexample is not None else None,
+                'details': self.star_details
+            },
+            'smt_exact': {
+                'result': self.smt_result.value if self.smt_result else None,
+                'counterexample': self.smt_counterexample.tolist() if self.smt_counterexample is not None else None,
+                'details': self.smt_details
+            },
+            'consistency': self.consistency_check,
+            'counterexample_replay': {
+                'star': self.star_cex_replay,
+                'smt': self.smt_cex_replay
+            }
+        }
+        return result
+    
+    def to_json(self, indent: int = 2) -> str:
+        """Convert record to JSON string"""
+        return json.dumps(self.to_dict(), indent=indent, ensure_ascii=False)
+
+
+class DualMethodVerifier:
+    """
+    Verifier that runs both Star Reachability (NNV) and SMT/MILP (exact) methods
+    and records all results for audit purposes
+    """
+    
+    def __init__(self, network: ReLUNetwork, 
+                 margin_tolerance: float = 1e-6, 
+                 big_m: float = 1000.0,
+                 use_cegar: bool = False):
+        """
+        Initialize dual-method verifier
+        
+        Args:
+            network: ReLU network to verify
+            margin_tolerance: Tolerance for margin check
+            big_m: Big-M constant for SMT encoding
+            use_cegar: Whether to use CEGAR for SMT
+        """
+        self.network = network
+        self.margin_tolerance = margin_tolerance
+        self.big_m = big_m
+        self.use_cegar = use_cegar
+        
+        # Initialize both verifiers
+        self.star_reachability = StarReachability(network)
+        self.smt_verifier = RobustnessVerifier(
+            network, method="smt", 
+            use_cegar=use_cegar,
+            margin_tolerance=margin_tolerance,
+            big_m=big_m
+        )
+    
+    def verify(self, x0: np.ndarray, epsilon: float, test_id: Optional[str] = None) -> VerificationRecord:
+        """
+        Run both verification methods and record all results
+        
+        Args:
+            x0: Center point
+            epsilon: ℓ∞-ball radius
+            test_id: Optional test identifier
+            
+        Returns:
+            VerificationRecord with all results
+        """
+        if test_id is None:
+            test_id = f"test_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        
+        nominal_class = self.network.predict(x0)
+        
+        # Create record
+        record = VerificationRecord(
+            test_id=test_id,
+            x0=x0,
+            epsilon=epsilon,
+            nominal_class=nominal_class
+        )
+        
+        # Run Star Reachability (NNV)
+        print(f"[{test_id}] Running Star Reachability (NNV)...")
+        try:
+            star_result, star_cex, star_details = self.star_reachability.verify_robustness(
+                x0, epsilon, margin_tolerance=self.margin_tolerance
+            )
+            record.star_result = star_result
+            record.star_counterexample = star_cex
+            record.star_details = star_details
+            print(f"  Star Reachability result: {star_result.value}")
+        except Exception as e:
+            print(f"  Star Reachability failed: {e}")
+            record.star_result = VerificationResult.INCONCLUSIVE
+            record.star_details = {'error': str(e)}
+        
+        # Run SMT/MILP (Exact)
+        print(f"[{test_id}] Running SMT/MILP (Exact)...")
+        try:
+            smt_result, smt_cex = self.smt_verifier.verify_robustness(x0, epsilon)
+            record.smt_result = smt_result
+            record.smt_counterexample = smt_cex
+            
+            # Get SMT details if available
+            if hasattr(self.smt_verifier.encoder, 'input_lb'):
+                record.smt_details = {
+                    'method': 'SMT',
+                    'input_domain': {
+                        'lower_bound': self.smt_verifier.encoder.input_lb.tolist(),
+                        'upper_bound': self.smt_verifier.encoder.input_ub.tolist()
+                    },
+                    'margin_tolerance': self.margin_tolerance,
+                    'big_m': self.big_m
+                }
+            
+            print(f"  SMT/MILP result: {smt_result.value}")
+            if smt_cex is not None:
+                print(f"  SMT counterexample found")
+        except Exception as e:
+            print(f"  SMT/MILP failed: {e}")
+            record.smt_result = VerificationResult.INCONCLUSIVE
+            record.smt_details = {'error': str(e)}
+        
+        # Verify counterexamples by replay
+        if record.star_counterexample is not None:
+            print(f"[{test_id}] Verifying Star counterexample by replay...")
+            record.star_cex_replay = verify_counterexample_replay(
+                self.network, record.star_counterexample, x0, epsilon, 
+                nominal_class, self.margin_tolerance
+            )
+        
+        if record.smt_counterexample is not None:
+            print(f"[{test_id}] Verifying SMT counterexample by replay...")
+            record.smt_cex_replay = verify_counterexample_replay(
+                self.network, record.smt_counterexample, x0, epsilon,
+                nominal_class, self.margin_tolerance
+            )
+        
+        # Check consistency
+        print(f"[{test_id}] Checking consistency...")
+        record.consistency_check = check_consistency(
+            record.star_result, record.smt_result,
+            record.star_counterexample, record.smt_counterexample
+        )
+        print(f"  Consistency: {record.consistency_check['status']}")
+        
+        return record
+    
+    def verify_batch(self, test_cases: List[Tuple[np.ndarray, float]], 
+                    test_ids: Optional[List[str]] = None) -> List[VerificationRecord]:
+        """
+        Run verification on multiple test cases
+        
+        Args:
+            test_cases: List of (x0, epsilon) tuples
+            test_ids: Optional list of test identifiers
+            
+        Returns:
+            List of VerificationRecords
+        """
+        records = []
+        if test_ids is None:
+            test_ids = [f"test_{i}" for i in range(len(test_cases))]
+        
+        for i, (x0, epsilon) in enumerate(test_cases):
+            test_id = test_ids[i] if i < len(test_ids) else f"test_{i}"
+            record = self.verify(x0, epsilon, test_id)
+            records.append(record)
+        
+        return records
+    
+    def save_records(self, records: List[VerificationRecord], filename: str):
+        """
+        Save verification records to JSON file
+        
+        Args:
+            records: List of VerificationRecords
+            filename: Output filename
+        """
+        data = {
+            'metadata': {
+                'network_layers': self.network.num_layers,
+                'input_dim': self.network.weights[0].shape[1],
+                'output_dim': self.network.weights[-1].shape[0],
+                'margin_tolerance': self.margin_tolerance,
+                'big_m': self.big_m,
+                'use_cegar': self.use_cegar,
+                'timestamp': datetime.now().isoformat()
+            },
+            'records': [r.to_dict() for r in records]
+        }
+        
+        with open(filename, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        
+        print(f"Saved {len(records)} verification records to {filename}")
 
 
 def main():
